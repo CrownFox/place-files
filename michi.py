@@ -1,0 +1,425 @@
+#!/usr/bin/env python3
+
+import math
+from enum import Enum
+import time
+import json
+
+import os
+import sys
+
+import requests
+from bs4 import BeautifulSoup
+
+import urllib
+from io import BytesIO
+from websocket import create_connection
+from websocket import WebSocketConnectionClosedException
+from PIL import ImageColor
+from PIL import Image
+import random
+
+import argparse
+
+parser = argparse.ArgumentParser()
+parser.add_argument("username", nargs="?")
+parser.add_argument("password", nargs="?")
+args = parser.parse_args()
+if args.username is None or args.password is None:
+  import botConfig
+else:
+  botConfig = args
+
+
+SET_PIXEL_QUERY = \
+"""mutation setPixel($input: ActInput!) {
+  act(input: $input) {
+    data {
+      ... on BasicMessage {
+        id
+        data {
+          ... on GetUserCooldownResponseMessageData {
+            nextAvailablePixelTimestamp
+            __typename
+          }
+          ... on SetPixelResponseMessageData {
+            timestamp
+            __typename
+          }
+          __typename
+        }
+        __typename
+      }
+      __typename
+    }
+    __typename
+  }
+}
+"""
+
+
+def rgb_to_hex(rgb):
+    return ("#%02x%02x%02x%02x" % rgb).upper()
+
+
+# function to find the closest rgb color from palette to a target rgb color
+def closest_color(target_rgb, rgb_colors_array_in):
+    r, g, b, a = target_rgb
+    color_diffs = []
+    for color in rgb_colors_array_in:
+        cr, cg, cb, ca = color
+        color_diff = math.sqrt((r - cr)**2 + (g - cg)**2 + (b - cb)**2 + (a - ca)**2)
+        color_diffs.append((color_diff, color))
+    return min(color_diffs)[1]
+
+rgb_colors_array = []
+
+class Color(Enum):
+    BLACK = 27
+    WHITE = 31
+
+
+class Placer:
+    REDDIT_URL = "https://www.reddit.com"
+    LOGIN_URL = REDDIT_URL + "/login"
+    INITIAL_HEADERS = {
+        "accept":
+        "*/*",
+        "accept-encoding":
+        "gzip, deflate, br",
+        "accept-language":
+        "en-US,en;q=0.9",
+        "content-type":
+        "application/x-www-form-urlencoded",
+        "origin":
+        REDDIT_URL,
+        "sec-ch-ua":
+        '" Not A;Brand";v="99", "Chromium";v="100", "Google Chrome";v="100"',
+        "sec-ch-ua-mobile":
+        "?0",
+        "sec-ch-ua-platform":
+        '"Windows"',
+        "sec-fetch-dest":
+        "empty",
+        "sec-fetch-mode":
+        "cors",
+        "sec-fetch-site":
+        "same-origin",
+        "user-agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.60 Safari/537.36"
+    }
+
+    def __init__(self):
+        self.client = requests.session()
+        self.client.headers.update(self.INITIAL_HEADERS)
+
+        self.token = None
+
+    def login(self, username: str, password: str):
+        # get the csrf token
+        r = self.client.get(self.LOGIN_URL)
+        time.sleep(1)
+
+        login_get_soup = BeautifulSoup(r.content, "html.parser")
+        csrf_token = login_get_soup.find("input",
+                                         {"name": "csrf_token"})["value"]
+
+        # authenticate
+        r = self.client.post(self.LOGIN_URL,
+                             data={
+                                 "username": username,
+                                 "password": password,
+                                 "dest": self.REDDIT_URL,
+                                 "csrf_token": csrf_token
+                             })
+        time.sleep(1)
+
+        print(r.content)
+        assert r.status_code == 200
+
+        # get the new access token
+        r = self.client.get(self.REDDIT_URL)
+        data_str = BeautifulSoup(r.content, features="html5lib").find(
+            "script", {
+                "id": "data"
+            }).contents[0][len("window.__r = "):-1]
+        data = json.loads(data_str)
+        self.token = data["user"]["session"]["accessToken"]
+
+    def get_board(self, canvas):
+        print("Getting board")
+        ws = create_connection("wss://gql-realtime-2.reddit.com/query", origin="https://hot-potato.reddit.com")
+        ws.send(
+            json.dumps({
+                "type": "connection_init",
+                "payload": {
+                    "Authorization": "Bearer " + self.token
+                },
+            }))
+        ws.recv()
+        ws.send(
+            json.dumps({
+                "id": "1",
+                "type": "start",
+                "payload": {
+                    "variables": {
+                        "input": {
+                            "channel": {
+                                "teamOwner": "AFD2022",
+                                "category": "CONFIG",
+                            }
+                        }
+                    },
+                    "extensions": {},
+                    "operationName":
+                    "configuration",
+                    "query":
+                    "subscription configuration($input: SubscribeInput!) {\n  subscribe(input: $input) {\n    id\n    ... on BasicMessage {\n      data {\n        __typename\n        ... on ConfigurationMessageData {\n          colorPalette {\n            colors {\n              hex\n              index\n              __typename\n            }\n            __typename\n          }\n          canvasConfigurations {\n            index\n            dx\n            dy\n            __typename\n          }\n          canvasWidth\n          canvasHeight\n          __typename\n        }\n      }\n      __typename\n    }\n    __typename\n  }\n}\n",
+                },
+            }))
+        ws.recv()
+        ws.send(
+            json.dumps({
+                "id": "2",
+                "type": "start",
+                "payload": {
+                    "variables": {
+                        "input": {
+                            "channel": {
+                                "teamOwner": "AFD2022",
+                                "category": "CANVAS",
+                                "tag": str(canvas),
+                            }
+                        }
+                    },
+                    "extensions": {},
+                    "operationName":
+                    "replace",
+                    "query":
+                    "subscription replace($input: SubscribeInput!) {\n  subscribe(input: $input) {\n    id\n    ... on BasicMessage {\n      data {\n        __typename\n        ... on FullFrameMessageData {\n          __typename\n          name\n          timestamp\n        }\n        ... on DiffFrameMessageData {\n          __typename\n          name\n          currentTimestamp\n          previousTimestamp\n        }\n      }\n      __typename\n    }\n    __typename\n  }\n}\n",
+                },
+            }))
+
+        file = ""
+        while True:
+            temp = json.loads(ws.recv())
+            if temp["type"] == "data":
+                msg = temp["payload"]["data"]["subscribe"]
+                if msg["data"]["__typename"] == "FullFrameMessageData":
+                    file = msg["data"]["name"]
+                    break
+
+        ws.close()
+
+        boardimg = BytesIO(requests.get(file, stream=True).content)
+        print("Got image:", file)
+
+        return boardimg
+
+    def place_tile(self, canvas: int, x: int, y: int, color: int):
+        headers = self.INITIAL_HEADERS.copy()
+        headers.update({
+            "apollographql-client-name": "mona-lisa",
+            "apollographql-client-version": "0.0.1",
+            "content-type": "application/json",
+            "origin": "https://hot-potato.reddit.com",
+            "referer": "https://hot-potato.reddit.com/",
+            "sec-fetch-site": "same-site",
+            "authorization": "Bearer " + self.token
+        })
+
+        r = requests.post("https://gql-realtime-2.reddit.com/query",
+                          json={
+                              "operationName": "setPixel",
+                              "query": SET_PIXEL_QUERY,
+                              "variables": {
+                                  "input": {
+                                      "PixelMessageData": {
+                                          "canvasIndex": canvas,
+                                          "colorIndex": color,
+                                          "coordinate": {
+                                              "x": x,
+                                              "y": y
+                                          }
+                                      },
+                                      "actionName": "r/replace:set_pixel"
+                                  }
+                              }
+                          },
+                          headers=headers)
+
+        if r.json()["data"] == None:
+            try:
+              waitTime = math.floor(
+                  r.json()["errors"][0]["extensions"]["nextAvailablePixelTs"])
+              print("placing failed: rate limited")
+            except:
+              waitTime = 10000
+        else:
+            waitTime = math.floor(r.json()["data"]["act"]["data"][0]["data"]
+                                  ["nextAvailablePixelTimestamp"])
+            print("placing succeeded")
+
+        return waitTime / 1000
+
+
+color_map = {
+    "#BE0039FF": 1, 
+    "#FF4500FF": 2,  # bright red
+    "#FFA800FF": 3,  # orange
+    "#FFD635FF": 4,  # yellow
+    "#FFF8B8FF": 5,
+    "#00A368FF": 6,  # darker green
+    "#00CC78FF": 7,
+    "#7EED56FF": 8,  # lighter green
+    "#00756FFF": 9,
+    "#009EAAFF": 10,
+    "#00CCC0FF": 11,
+    "#2450A4FF": 12,  # darkest blue
+    "#3690EAFF": 13,  # medium normal blue
+    "#51E9F4FF": 14,  # cyan
+    "#493AC1FF": 15,
+    "#6A5CFFFF": 16,
+    "#94B3FFFF": 17,
+    "#811E9FFF": 18,  # darkest purple
+    "#B44AC0FF": 19,  # normal purple
+    "#E4ABFFFF": 20,
+    "#DE107FFF": 21,
+    "#FF3881FF": 22,
+    "#FF99AAFF": 23,  # pink
+    "#6D482FFF": 24,
+    "#9C6926FF": 25,  # brown
+    "#FFB470FF": 26,
+    "#000000FF": 27,  # black
+    "#515252FF": 28,
+    "#898D90FF": 29,  # grey
+    "#D4D7D9FF": 30,  # light grey
+    "#FFFFFFFF": 31,  # white
+}
+
+def init_rgb_colors_array():
+  global rgb_colors_array
+
+  # generate array of available rgb colors we can use
+  for color_hex, color_index in color_map.items():
+    rgb_array = ImageColor.getcolor(color_hex, "RGBA")
+    rgb_colors_array.append(rgb_array)
+    
+  print("available colors for palette (rgba): ", rgb_colors_array)
+
+init_rgb_colors_array()
+
+place = Placer()
+
+version = "0.4.2"
+
+def trigger():
+  # Behold, the dirtiest code I ever wrote
+  # This hacky hack serves as a bridge for urllib in Python 2 and Python 3
+  try:
+    urllib.urlopen
+  except:
+    urllib.urlopen = urllib.request.urlopen
+
+  def getData():
+    im = urllib.urlopen('https://github.com/CrownFox/place-files/raw/main/michi.png?t={}'.format(time.time())).read()
+    img = Image.open(BytesIO(im)).convert("RGBA").load()
+		
+    new_origin = urllib.urlopen('https://github.com/CrownFox/place-files/raw/main/michi.txt?t={}'.format(time.time())).read().decode("utf-8").replace("\n", "").split(',')
+    origin = (int(new_origin[0]), int(new_origin[1]))
+    size = (int(new_origin[2]), int(new_origin[3]))
+    canvas = int(new_origin[4])
+
+    #ver = urllib.urlopen('https://CloudburstSys.github.io/place.conep.one/version.txt?t={}'.format(time.time())).read().decode("utf-8").replace("\n", "")
+
+    #print("LOCAL VERSION: {}".format(version))
+    #print("UPSTREAM VERSION: {}".format(ver))
+
+    #if(ver != version):
+    #  print("VERSION OUT OF DATE!")
+    #  print("PLEASE RUN 'git pull https://github.com/CloudburstSys/PonyPixel.git' TO UPDATE")
+    #  
+    #  return (None, (None, None), (None, None), None)
+
+    return (img, origin, size, canvas)
+
+  (img, origin, size, canvas) = getData()
+  
+  if(img == None):
+    exit()
+    return
+
+  (ox, oy) = origin
+  (sx, sy) = size
+
+  pix2 = Image.open(place.get_board(canvas)).convert("RGBA").load()
+
+  rows = []
+  thisRow = []
+
+  totalPixels = sx*sy
+  correctPixels = 0
+  wrongPixels = 0
+
+  wrongPixelsArray = []
+
+  for i in range(sx*sy):
+    x = (i % sx) + ox
+    y = math.floor(i / sx) + oy
+
+    (red, green, blue, alpha) = img[x-ox, y-oy]
+	
+    if(color_map[rgb_to_hex(closest_color(pix2[x, y], rgb_colors_array))] == color_map[rgb_to_hex(closest_color(img[x-ox, y-oy],rgb_colors_array))]):
+		  # Great! They're equal!
+      correctPixels += 1
+    elif(alpha == 0):
+      # Blank pixel. we ignore it
+      totalPixels = totalPixels - 1
+    else:
+      #print("Pixel at ({},{}) damaged: Expected: {}, got {}".format(x,y, color_text_map[color_map[rgb_to_hex(closest_color(img[x-ox, y-oy],rgb_colors_array))]], color_text_map[color_map[rgb_to_hex(closest_color(pix2[x, y], rgb_colors_array))]]))
+      wrongPixels += 1
+      wrongPixelsArray.append((x,y,rgb_to_hex(closest_color(img[x-ox, y-oy],rgb_colors_array))))
+
+  print("{}% correct ({} out of {}), {} wrong pixels".format(math.floor((correctPixels/totalPixels)*100),correctPixels,totalPixels,wrongPixels))
+
+  if(len(wrongPixelsArray) == 0):
+    print("nothing to do!")
+
+    return time.time() + random.randint(5,30)
+  else:
+    (x,y,expected) = random.choice(wrongPixelsArray)	
+
+    print("Fixing pixel at ({},{}) on canvas id {}... Replacing with {}".format(x,y,canvas,expected))
+    timestampOfSafePlace = place.place_tile(int(canvas),x,y,color_map[expected]) + random.randint(5,30)
+    print("Done. Can next place at {} seconds from now".format(timestampOfSafePlace - time.time()))
+
+    return timestampOfSafePlace
+
+timestampOfPlaceAttempt = 0
+
+place.login(botConfig.username, botConfig.password)
+
+while True:
+  if timestampOfPlaceAttempt > time.time():
+    time.sleep(5)
+    continue
+
+  try: 
+    timestampOfPlaceAttempt = trigger()
+
+    if((timestampOfPlaceAttempt - time.time()) > 86400):
+      # Play a bell to alert the user with "\a". When using a terminal multiplexer such as tmux, the user can be alerted about the status of the bot. This is also useful when using a terminal emulator.
+      print("\a ")
+      print(" ")
+      print("-------------------------------")
+      print("BOT BANNED FROM R/PLACE")
+      print("Please generate a new account and rerun.")
+      exit(1)
+  except WebSocketConnectionClosedException:
+    print("\aWebSocket connection refused. Auth issue. Reloading...")
+    os.execv(sys.argv[0], sys.argv)
+    exit(2)
+  except Exception:
+    print("wtfff????? idk what's going on im dumb probably")
+
+  time.sleep(5)
